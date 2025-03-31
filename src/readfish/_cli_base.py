@@ -30,6 +30,7 @@ def main(argv: list[str] | None = None) -> None:
     cmds = [
         ("targets", "targets"),
         ("barcode-targets", "targets"),
+        ("balance", "balance"),
         ("unblock-all", "unblock_all"),
         ("validate", "validate"),
         ("stats", "stats"),

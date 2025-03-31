@@ -174,6 +174,7 @@ class _PluginModule:
             "mappy": "mappy",
             "mappy_rs": "mappy_rs",
             "mappy-rs": "mappy_rs",
+            "seqtagger": "seqtagger",
             "no_op": "_no_op",
         }
         if self.name in builtins and not override:

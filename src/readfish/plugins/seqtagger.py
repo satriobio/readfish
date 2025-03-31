@@ -81,10 +81,6 @@ class Caller():
         else:
             self.sample_rate = float(5000)
 
-        self.seqtagger_params['model'] = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/crg/b100_RNA004" # b100_RNA004.zip
-        self.seqtagger_params['model_secret'] = "iY8Hfro9"
-        self.seqtagger_params['batchsize'] = 512
-        self.seqtagger_params['min_baseq'] = 50
         self.validate()
         
         self.demux_model = load_demux_model(self.seqtagger_params['model'], self.seqtagger_params['batchsize'], pwd=self.seqtagger_params['model_secret'])
@@ -141,7 +137,7 @@ class Caller():
         with open("debug_log.tsv", "a") as log_file:  # 'a' mode for appending
             for (channel, read), (barcode, mapq, baseq) in zip(reads, calls):
                 # Update barcode counts in database for high-quality bases
-                if baseq > 50:
+                if baseq > self.seqtagger_params['min_baseq']:
                     self.barcode_db[barcode] = self.barcode_db.get(barcode, 0) + 1
 
                     # Determine alignment type (default is "P")
@@ -154,7 +150,7 @@ class Caller():
                     
                     yield (channel, read, barcode, mapq, baseq, aln)
 
-    def call(
+    def basecall(
         self,
         reads: Iterable[tuple[int, minknow_api.data_pb2.GetLiveReadsResponse.ReadData]],
         signal_dtype: npt.DTypeLike,
@@ -187,7 +183,7 @@ class Caller():
             yield Result(
                 channel=channel,
                 read_id=read.id,
-                seq=None,
+                seq=[],
                 barcode=None,
                 basecall_data=(barcode, mapq, baseq),
                 alignment_data=[aln],

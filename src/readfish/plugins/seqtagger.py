@@ -86,6 +86,7 @@ class Caller():
         
         self.demux_model = load_demux_model(self.seqtagger_params['model'], self.seqtagger_params['batchsize'], pwd=self.seqtagger_params['model_secret'])
         self.demux_chunksize = self.demux_model.config['basecaller']['chunksize']
+        self.demux_chunksize_max = self.demux_chunksize*2 
 
         self.barcode_db = defaultdict(int)
         self.barcode_db_unblock = defaultdict(int)
@@ -108,7 +109,7 @@ class Caller():
         if model_path.suffix.lower() != ".zip":
             raise RuntimeError(f"Provided model file '{model_path}' is of an incorrect type; expected a .zip file.")
     
-    def is_sig(self, barcode, min_reads=10, min_fold_enrichment=2.0):
+    def is_sig(self, barcode, barcode_db, min_reads=10, min_fold_enrichment=2.0):
         """Determine if a barcode count is significantly higher than others
         
         Args:
@@ -119,24 +120,49 @@ class Caller():
         Returns:
             bool: Whether the barcode is significantly enriched
         """
-        if not self.barcode_db or barcode not in self.barcode_db:
-            return False
-            
-        top_count = self.barcode_db[barcode]
-        total_counts = sum(self.barcode_db.values())
+        top_count = barcode_db.get(barcode, 0)  # Ensure barcode exists in filtered list
+        total_counts = sum(barcode_db.values())
+        barcodes_num = len(barcode_db)
         
-        # Filter valid barcodes (if you have such a list)
-        valid_barcodes = [bc for bc in self.barcode_db.keys() if bc in self.valid_barcodes] \
-                        if hasattr(self, 'valid_barcodes') else list(self.barcode_db.keys())
-        
-        if not valid_barcodes:
-            return False
-            
-        barcodes_num = len(valid_barcodes)
         expected_uniform_count = total_counts / barcodes_num
-        
+
         return (top_count >= min_reads and 
                 top_count >= min_fold_enrichment * expected_uniform_count)
+
+    def barcode_significance(self, barcode_db, min_reads=10):
+        """Compute fold enrichment and depletion for each barcode.
+        
+        Args:
+            barcode_db: Dictionary of barcode counts
+            min_reads: Minimum absolute read count
+            
+        Returns:
+            dict: Barcode enrichment scores, dict: Barcode depletion scores
+        """
+        if not barcode_db:
+            return {}, {}
+
+        total_counts = sum(barcode_db.values())
+        barcodes_num = len(barcode_db)
+
+        if barcodes_num == 0 or total_counts == 0:
+            return {}, {}
+
+        expected_uniform_count = total_counts / barcodes_num
+
+        enrichment_scores = {
+            barcode: count / expected_uniform_count
+            for barcode, count in barcode_db.items()
+        }
+
+        # Identify depleted barcodes
+        depleted_barcodes = {
+            barcode: count for barcode, count in barcode_db.items()
+            if count < (0.5 * expected_uniform_count)  # If <50% of expected
+        }
+
+        return enrichment_scores, depleted_barcodes
+
 
     def make_decision(self, reads, calls):
         """Process barcode calls and make alignment decisions, logging cumulative barcode stats.
@@ -168,28 +194,59 @@ class Caller():
             if batch_file.tell() == 0:
                 batch_file.write("timestamp\ttotal_reads\tqc_passed\tqc_failed\ttarget\n")
             if decision_file.tell() == 0:
-                decision_file.write("timestamp\tchannel\tread_id\tbarcode\tmapq\tbaseq\tclassification\tqc\n")
+                decision_file.write("timestamp\tchannel\tread_id\tbarcode\tmapq\tbaseq\tclassification\n")
 
-            # Log current proportion stats before processing this batch
-            for barcode in self.barcode_db.keys():
+            total_reads = sum(self.barcode_db.values())
+
+            # Filter valid target barcodes once
+            barcode_db_target = {
+                bc: self.barcode_db[bc]
+                for bc in self.barcode_db.keys()
+                if 'target_barcodes' not in self.seqtagger_params or bc in self.seqtagger_params['target_barcodes']
+            }
+            total_reads_valid = sum(barcode_db_target.values())
+
+            for barcode, count in self.barcode_db.items():
+                if 'target_barcodes' in self.seqtagger_params and barcode in self.seqtagger_params['target_barcodes']:
+                    proportion = count / total_reads_valid if total_reads_valid > 0 else 0
+                else:
+                    proportion = "not a valid barcode"
+
                 stats_file.write(
-                    f"{timestamp}\t{0}\t{barcode}\t{self.barcode_db[barcode]}\t"
-                    f"{(self.barcode_db[barcode]/sum(self.barcode_db.values())):.4f}\n"
+                    f"{timestamp}\t{total_reads}\t{barcode}\t{count}\t"
+                    f"{proportion if isinstance(proportion, str) else f'{proportion:.4f}'}\n"
                 )
 
-            # Find barcode with high frequency
-            top_barcode = max(self.barcode_db, key=self.barcode_db.get) if self.barcode_db else None
-            top_is_sig = self.is_sig(top_barcode) if top_barcode else False           
+            # Find barcode with highest frequency
+            # top_barcode = max(self.barcode_db, key=self.barcode_db.get) if self.barcode_db else None
+            # top_is_sig = self.is_sig(top_barcode, barcode_db_target) if top_barcode else False
 
-            for (channel, read), (barcode, mapq, baseq) in zip(reads, calls):
-                barcode = str(barcode)
+            # Compute enrichment & find depleted barcodes
+            enrichment_scores, depleted_barcodes = self.barcode_significance(barcode_db_target)
+
+            # Find the most enriched barcode
+            top_barcode = max(enrichment_scores, key=enrichment_scores.get) if enrichment_scores else None
+
+            # Threshold for significant enrichment
+            threshold = 1.5  
+            top_is_sig = enrichment_scores.get(top_barcode, 0) >= threshold if top_barcode else False
+
+            if depleted_barcodes:
+                unblocked_barcodes = [bc for bc in enrichment_scores if enrichment_scores[bc] >= 1.0]
+            else:
+                unblocked_barcodes = [top_barcode] if top_is_sig else []
+
+            for idx, (channel, read) in enumerate(reads):
+                barcode = str(calls[idx][0])
+                mapq = calls[idx][1]
+                baseq = calls[idx][2]
 
                 # Filter calls based on baseq
                 if baseq > self.seqtagger_params['min_baseq']:
                     batch_stats['qc_passed'] += 1
 
                     # Label significantly frequent barcode as target to unblock
-                    classification = "TARGET" if (barcode == top_barcode and top_is_sig) else "NONTARGET"
+                    classification = "TARGET" if barcode in unblocked_barcodes else "NONTARGET"
                     if classification == "TARGET":
                         batch_stats['target_reads'] += 1
                         self.barcode_db_unblock[barcode] += 1
@@ -201,12 +258,12 @@ class Caller():
                     # Log decision
                     decision_file.write(
                         f"{timestamp}\t{channel}\t{read.id}\t{barcode}\t"
-                        f"{mapq}\t{baseq}\t{classification}\tqc_passed\n"
+                        f"{mapq}\t{baseq}\t{classification}\n"
                     )
 
                     yield (channel, read, barcode, mapq, baseq, aln)
-                # else:
-                #     batch_stats['qc_failed'] += 1
+                else:
+                    batch_stats['qc_failed'] += 1
                 #     decision_file.write(
                 #         f"{timestamp}\t{channel}\t{read.id}\t{barcode}\t"
                 #         f"{mapq}\t{baseq}\tNONE\tqc_failed\n"
@@ -221,7 +278,7 @@ class Caller():
                 f"{batch_stats['target_reads']}\n"
             )
 
-    def preprocess_read(self, read: np.ndarray, chunksize: int, offset: int) -> np.ndarray:
+    def preprocess_read(self, read: np.ndarray, offset: int) -> np.ndarray:
         """
         Normalize the first `chunksize` values of `read` using median and MAD.
         
@@ -232,8 +289,8 @@ class Caller():
         Returns:
             np.ndarray: The normalized signal.
         """
-        median, mad = get_med_mad(read[offset:chunksize+offset])
-        normalized_signal = (read[:chunksize] - median) / mad
+        median, mad = get_med_mad(read[:self.demux_chunksize])
+        normalized_signal = (read[:self.demux_chunksize_max] - median) / mad
         return normalized_signal
 
     def basecall(
@@ -252,44 +309,17 @@ class Caller():
         :rtype: readfish.plugins.utils.Result
         """
 
-        # reads is a list of (channel, read) tuples
-        batch_size = self.seqtagger_params['batchsize']
-        signal_array = np.zeros((batch_size, self.demux_chunksize), dtype=np.float16)
+        signal_array = np.zeros((self.seqtagger_params['batchsize'], self.demux_chunksize_max), dtype=np.float16)
 
         # Process all reads in one go
-        for channel, read in reads:
+        for idx, (channel, read) in enumerate(reads):
             signal = np.frombuffer(read.raw_data, dtype=signal_dtype)
             signal_pA = (signal + daq_values[channel].offset) * daq_values[channel].scaling
-            signal_array[channel] = self.preprocess_read(signal_pA, self.demux_chunksize, offset=0)
+            signal_array[idx] = self.preprocess_read(signal_pA, offset=0)
 
         # Initial barcode processing
-        calls = chunks2barcodes(self.demux_model, signal_array)
-        calls = calls[0:len(reads)]
-
-        # # Check which reads need reprocessing with different offset
-        # resubmit_indices = [i for i, (_, _, baseq) in enumerate(calls) if baseq < 50]
-
-        # # Only process channels that need retrying
-        # if resubmit_indices:  # Only if we have reads to retry
-        #     signal_array_retry = np.zeros_like(signal_array)
-        #     for idx, (channel, read) in enumerate(reads):
-        #         if idx in resubmit_indices:
-        #             signal = np.frombuffer(read.raw_data, dtype=signal_dtype)
-        #             signal_pA = (signal + daq_values[channel].offset) * daq_values[channel].scaling
-        #             signal_array_retry[channel] = self.preprocess_read(
-        #                 signal_pA, 
-        #                 self.demux_chunksize, 
-        #                 offset=self.demux_chunksize//2
-        #             )
-            
-        #     # Second barcode processing for retried signals
-        #     retry_calls = chunks2barcodes(self.demux_model, signal_array_retry)
-            
-        #     # Update only the calls that were retried
-        #     for idx in resubmit_indices:
-        #         calls[idx] = retry_calls[idx]
-
-        # Combine results and make final decision
+        calls = chunks2barcodes(self.demux_model, signal_array[:, 0:self.demux_chunksize])
+        
         results = self.make_decision(reads, calls)
 
         for channel, read, barcode, mapq, baseq, aln in results:  # Fixed syntax and iteration logic

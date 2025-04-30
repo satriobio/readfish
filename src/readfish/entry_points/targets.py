@@ -613,21 +613,31 @@ If there isn't a newer version of readfish and readfish is failing, please open 
 
     # Fetch sequencing device
     position = get_device(args.device, host=args.host, port=args.port)
+    flowcell_type = position.connect().protocol.get_run_info().flow_cell.user_specified_product_code
+
+    if flowcell_type in ['FLO-MIN004RA']:
+        prefilter_classes = {
+            "strand",
+            "adapter",
+            "unknown_positive",
+        }
+    else:
+        prefilter_classes = {
+            "strand",
+            # "strand2",
+            "short_strand",
+            "adapter",
+            "unknown_positive",
+        }
 
     # Create a read until client
     read_until_client = RUClient(
         mk_host=position.host,
         mk_port=position.description.rpc_ports.secure,
-        filter_strands=True,
+        filter_strands=False,
         cache_type=AccumulatingCache,
         timeout=args.wait_for_ready,
-        prefilter_classes={
-            "strand",
-            "strand2",
-            "short_strand",
-            "adapter",
-            "unknown_positive",
-        },
+        prefilter_classes=prefilter_classes,
     )
 
     # Load TOML configuration
@@ -647,19 +657,29 @@ If there isn't a newer version of readfish and readfish is failing, please open 
         Severity.WARN,
     )
 
-    # start the client running
+    if flowcell_type in ['FLO-MIN004RA']:
+        accepted_first_chunk_classifications = [
+            "strand",
+            "adapter",
+            "unknown_positive",
+        ]
+    else:
+        accepted_first_chunk_classifications = [
+            "strand",
+            # "strand2",
+            "short_strand",
+            "adapter",
+            "unknown_positive",
+        ]
+
+    # Start the client running
     read_until_client.run(
         first_channel=1,
         last_channel=read_until_client.channel_count,
         max_unblock_read_length_seconds=args.max_unblock_read_length_seconds,
-        accepted_first_chunk_classifications=[
-            "strand",
-            "strand2",
-            "short_strand",
-            "adapter",
-            "unknown_positive",
-        ],
+        accepted_first_chunk_classifications=accepted_first_chunk_classifications,
     )
+
 
     worker = Analysis(
         read_until_client,

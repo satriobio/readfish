@@ -22,8 +22,7 @@ from readfish._utils import nice_join
 
 from collections import defaultdict
 from datetime import datetime
-
-UNMAPPED_PAF = "0\t0\t*\t*\t0\t0\t0\t0\t0\t0"
+import random
 
 class Alignment():
     def __init__(self, ctg):
@@ -72,79 +71,63 @@ class Aligner(AlignerABC):
 
     def disconnect(self) -> None:
         return
-
-    def is_sig(self, barcode, barcode_db, min_reads=10, min_fold_enrichment=2.0):
-            """Determine if a barcode count is significantly higher than others
-            
-            Args:
-                barcode: Barcode to test
-                min_reads: Minimum absolute read count to consider
-                min_fold_enrichment: Minimum fold-enrichment over expected uniform distribution
-                
-            Returns:
-                bool: Whether the barcode is significantly enriched
-            """
-            top_count = barcode_db.get(barcode, 0)  # Ensure barcode exists in filtered list
-            total_counts = sum(barcode_db.values())
-            barcodes_num = len(barcode_db)
-            
-            expected_uniform_count = total_counts / barcodes_num
-
-            return (top_count >= min_reads and 
-                    top_count >= min_fold_enrichment * expected_uniform_count)
     
-    def barcode_significance(self, barcode_db, min_reads=10):
-        """Compute fold enrichment and depletion for each barcode.
+    def leveling_enrichment(self, barcode_db, min_reads=1000, upper_threshold=1.5, lower_threshold=0.5):
+        """Identify usable barcodes based on enrichment/depletion analysis.
         
         Args:
-            barcode_db: Dictionary of barcode counts
-            min_reads: Minimum absolute read count
+            barcode_db: Dictionary {barcode: count} of read counts
+            min_reads: Minimum absolute read count to consider a barcode
+            upper_threshold: Fold-enrichment above which barcode is always unblocked
+            lower_threshold: Fold-enrichment below which barcode is considered depleted
             
         Returns:
-            dict: Barcode enrichment scores, dict: Barcode depletion scores
+            tuple: (unblocked_barcodes, is_depleted)
+                unblocked_barcodes: List of barcodes passing filters
+                is_depleted: Boolean indicating if depletion was detected
         """
         if not barcode_db:
-            return {}, {}
+            return [], False
 
         total_counts = sum(barcode_db.values())
         barcodes_num = len(barcode_db)
 
         if barcodes_num == 0 or total_counts == 0:
-            return {}, {}
+            return [], False
 
-        expected_uniform_count = total_counts / barcodes_num
-
+        expected_count = total_counts / barcodes_num
+        
+        # Calculate enrichment and filter by min_reads
         enrichment_scores = {
-            barcode: count / expected_uniform_count
+            barcode: count / expected_count
             for barcode, count in barcode_db.items()
+            if count >= min_reads
         }
-
-        # Identify depleted barcodes
-        depleted_barcodes = {
-            barcode: count for barcode, count in barcode_db.items()
-            if count < (0.5 * expected_uniform_count)  # If <50% of expected
-        }
-
-        return enrichment_scores, depleted_barcodes
-
-    def barcode_keep_probabilities(self, barcode_db):
-        # Initialize the dictionary to store the keep probabilities
-        barcode_db_prob = defaultdict(float)
-
-        # Total reads in the barcode database
-        total_reads = sum(barcode_db.values())
-
-        # Compute inverse counts (1 / count for each barcode)
-        inv_counts = {bc: 1 / count for bc, count in barcode_db.items()}
-
-        # Normalize the inverse counts to get probabilities that sum to 1
-        total_inv = sum(inv_counts.values())
         
-        # Calculate the keep probabilities (normalize inverse counts)
-        for bc, inv_count in inv_counts.items():
-            barcode_db_prob[bc] = inv_count / total_inv
+        # Check for depletion (any barcode below lower threshold)
+        is_depleted = any(
+            count < (lower_threshold * expected_count)
+            for count in barcode_db.values()
+        )
         
-        return barcode_db_prob
+        # Determine unblocked barcodes
+        if is_depleted:
+            # When depletion exists, use barcodes at or above expected level
+            unblocked_barcodes = [
+                bc for bc, score in enrichment_scores.items()
+                if score >= 1.0
+            ]
+        else:
+            # Otherwise use barcodes above upper threshold (if any)
+            unblocked_barcodes = [
+                bc for bc, score in enrichment_scores.items()
+                if score >= upper_threshold
+            ]
+            # If none meet upper threshold, use all passing min_reads
+            if not unblocked_barcodes:
+                unblocked_barcodes = list(enrichment_scores.keys())
+        
+        return unblocked_barcodes
     
     def make_decision(self, reads):
         """Process barcode calls and make alignment decisions, logging cumulative barcode stats.
@@ -203,34 +186,7 @@ class Aligner(AlignerABC):
                 )
 
             # Find barcode with highest frequency
-            # top_barcode = max(self.barcode_db, key=self.barcode_db.get) if self.barcode_db else None
-            # top_is_sig = self.is_sig(top_barcode, barcode_db_target) if top_barcode else False
-
-            # Compute enrichment & find depleted barcodes
-            enrichment_scores, depleted_barcodes = self.barcode_significance(barcode_db_target)
-
-            # Find the most enriched barcode
-            top_barcode = max(enrichment_scores, key=enrichment_scores.get) if enrichment_scores else None
-
-            # Threshold for significant enrichment
-            threshold = 1.5  
-            top_is_sig = enrichment_scores.get(top_barcode, 0) >= threshold if top_barcode else False
-
-            if depleted_barcodes:
-                unblocked_barcodes = [bc for bc in enrichment_scores if enrichment_scores[bc] >= 1.0]
-            else:
-                unblocked_barcodes = [top_barcode] if top_is_sig else []
-
-            # barcode_db_target
-            # barcode_db_prob = self.barcode_keep_probabilities(barcode_db_target)
-            
-            # for idx, (channel, read) in enumerate(reads):
-
-            #  channel=channel,
-            #     read_id=read.id,
-            #     seq=[],
-            #     barcode=None,
-            #     basecall_data=final_call[idx],
+            unblocked_barcodes = self.leveling_enrichment(barcode_db_target, upper_threshold=self.leveling_params['upper_threshold'], lower_threshold=self.leveling_params['lower_threshold'])
             
             for read in reads:
                 channel = read.channel
@@ -244,13 +200,8 @@ class Aligner(AlignerABC):
                     batch_stats['qc_passed'] += 1
 
                     # Label significantly frequent barcode as target to unblock
-                    classification = "TARGET" if barcode in unblocked_barcodes else "NONTARGET"
-                    
-                    # prob = barcode_db_prob[barcode]
-
-                    # classification = "NO_TARGET"
-                    # if total_reads_valid > 1000:
-                    #      classification = "TARGET" if random.random() >= prob else "NO_TARGET"
+                    # classification = "TARGET" if barcode in unblocked_barcodes else "NONTARGET"
+                    classification = "TARGET" if (barcode in unblocked_barcodes and random.random() < self.leveling_params['likelihood']) else "NONTARGET"
 
                     if classification == "TARGET":
                         batch_stats['target_reads'] += 1
